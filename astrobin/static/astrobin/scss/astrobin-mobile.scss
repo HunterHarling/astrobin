@@ -164,6 +164,10 @@
             }
         }
     }
+
+    .top-picks-item img{
+        width: 354px !important;
+    }
 }
 
 
@@ -350,6 +354,14 @@
                 width: 100%;
             }
         }
+    }
+
+    .top-picks-item{
+        margin-right: 0 !important;
+    }
+
+    .top-picks-item img{
+        width: 100% !important;
     }
 }
 
