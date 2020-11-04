@@ -4,6 +4,7 @@ import logging
 from celery_haystack.indexes import CelerySearchIndex
 from django.contrib.auth.models import User
 from django.contrib.contenttypes.models import ContentType
+from django.db.models.functions import Length
 from haystack.constants import Indexable
 from haystack.fields import CharField, IntegerField, FloatField, DateTimeField, BooleanField, MultiValueField
 from hitcount.models import HitCount
@@ -17,6 +18,18 @@ from nested_comments.models import NestedComment
 from toggleproperties.models import ToggleProperty
 
 log = logging.getLogger('apps')
+
+
+def _average(values):
+    length = len(values)
+    if length > 0:
+        return sum(values) / float(length)
+    return 0
+
+
+def _astrobin_index(values):
+    import math
+    return _average(values) * math.log(len(values) + 1, 10)
 
 
 def _get_integration(image):
@@ -37,6 +50,74 @@ def _get_integration(image):
         return 0
 
     return integration
+
+
+def _prepare_comment_reputation(comments):
+    min_comment_length = 150
+    min_likes = 3
+
+    all_comments = comments \
+        .annotate(length=Length('text')) \
+        .filter(deleted=False, length__gte=min_comment_length)
+
+    all_comments_with_enough_likes = [x for x in all_comments if len(x.likes) >= min_likes]
+    all_comments_count = len(all_comments_with_enough_likes)
+
+    if all_comments_count == 0:
+        return 0
+
+    all_likes = 0
+    for comment in all_comments_with_enough_likes:
+        all_likes += len(comment.likes)
+
+    average = all_likes / float(all_comments_count)
+    normalized = []
+
+    for comment in all_comments_with_enough_likes:
+        likes = len(comment.likes)
+        if likes >= average:
+            normalized.append(likes)
+
+    if len(normalized) == 0:
+        return 0
+
+    return _astrobin_index(normalized)
+
+
+def _prepare_forum_post_reputation(posts):
+    min_post_length = 150
+    min_likes = 3
+
+    all_posts = posts \
+        .annotate(length=Length('body')) \
+        .filter(length__gte=min_post_length)
+
+    all_posts_with_enough_likes = [
+        x \
+        for x in all_posts \
+        if ToggleProperty.objects.toggleproperties_for_object('like', x).count() >= min_likes
+    ]
+    all_posts_count = len(all_posts_with_enough_likes)
+
+    if all_posts_count == 0:
+        return 0
+
+    all_likes = 0
+    for post in all_posts_with_enough_likes:
+        all_likes += ToggleProperty.objects.toggleproperties_for_object('like', post).count()
+
+    average = all_likes / float(all_posts_count)
+    normalized = []
+
+    for post in all_posts_with_enough_likes:
+        likes = ToggleProperty.objects.toggleproperties_for_object('like', post).count()
+        if likes >= average:
+            normalized.append(likes)
+
+    if len(normalized) == 0:
+        return 0
+
+    return _astrobin_index(normalized)
 
 
 def _prepare_likes(obj):
@@ -198,12 +279,17 @@ class UserIndex(CelerySearchIndex, Indexable):
     normalized_likes_1y = FloatField()
     normalized_likes = FloatField()
 
+    # User reputation based on text content
+    reputation_6m = FloatField()
+    reputation_1y = FloatField()
+    reputation = FloatField()
+
     # Number of followers
     followers_6m = IntegerField()
     followers_1y = IntegerField()
     followers = IntegerField()
 
-    # Total user ingegration.
+    # Total user integration.
     integration_6m = FloatField()
     integration_1y = FloatField()
     integration = FloatField()
@@ -233,7 +319,7 @@ class UserIndex(CelerySearchIndex, Indexable):
 
     def prepare_images_6m(self, obj):
         # Logging here just because it's the first "prepare" function.
-        log.debug("Indexing user %s: %d" % (obj.__class__.__name__, obj.pk))
+        log.debug("Indexing %s: %s (%d)" % (obj.__class__.__name__, obj.username, obj.pk))
 
         return Image.objects.filter(user=obj).filter(
             uploaded__gte=_6m_ago()).count()
@@ -293,15 +379,6 @@ class UserIndex(CelerySearchIndex, Indexable):
         return likes / float(images) if images > 0 else 0
 
     def prepare_normalized_likes_6m(self, obj):
-        def average(values):
-            if len(values):
-                return sum(values) / float(len(values))
-            return 0
-
-        def index(values):
-            import math
-            return average(values) * math.log(len(values) + 1, 10)
-
         avg = self.prepare_average_likes_6m(obj)
         norm = []
 
@@ -313,18 +390,9 @@ class UserIndex(CelerySearchIndex, Indexable):
         if len(norm) == 0:
             return 0
 
-        return index(norm)
+        return _astrobin_index(norm)
 
     def prepare_normalized_likes_1y(self, obj):
-        def average(values):
-            if len(values):
-                return sum(values) / float(len(values))
-            return 0
-
-        def index(values):
-            import math
-            return average(values) * math.log(len(values) + 1, 10)
-
         avg = self.prepare_average_likes_1y(obj)
         norm = []
 
@@ -336,30 +404,38 @@ class UserIndex(CelerySearchIndex, Indexable):
         if len(norm) == 0:
             return 0
 
-        return index(norm)
+        return _astrobin_index(norm)
 
     def prepare_normalized_likes(self, obj):
-        def average(values):
-            if len(values):
-                return sum(values) / float(len(values))
-            return 0
+        average = self.prepare_average_likes(obj)
+        normalized = []
 
-        def index(values):
-            import math
-            return average(values) * math.log(len(values) + 1, 10)
-
-        avg = self.prepare_average_likes(obj)
-        norm = []
-
-        for i in Image.objects.filter(user=obj):
+        for i in Image.objects.filter(user=obj).iterator():
             likes = i.likes()
-            if likes >= avg:
-                norm.append(likes)
+            if likes >= average:
+                normalized.append(likes)
 
-        if len(norm) == 0:
+        if len(normalized) == 0:
             return 0
 
-        return index(norm)
+        result = _astrobin_index(normalized)
+        log.debug("User %s (%d) has image index: %.2f" % (obj, obj.pk, result))
+        return result
+
+    def prepare_reputation_6m(self, obj):
+        return _prepare_comment_reputation(NestedComment.objects.filter(author=obj, created__gte=_6m_ago())) + \
+               _prepare_forum_post_reputation(Post.objects.filter(user=obj, created__gte=_6m_ago()))
+
+    def prepare_reputation_1y(self, obj):
+        return _prepare_comment_reputation(NestedComment.objects.filter(author=obj, created__gte=_1y_ago())) + \
+               _prepare_forum_post_reputation(Post.objects.filter(user=obj, created__gte=_1y_ago()))
+
+    def prepare_reputation(self, obj):
+        comments_reputation = _prepare_comment_reputation(NestedComment.objects.filter(author=obj))
+        forum_post_reputation = _prepare_forum_post_reputation(Post.objects.filter(user=obj))
+        log.debug("User %s (%d) has comment reputation: %.2f" % (obj, obj.pk, comments_reputation))
+        log.debug("User %s (%d) has forum post reputation: %.2f" % (obj, obj.pk, forum_post_reputation))
+        return comments_reputation + forum_post_reputation
 
     def prepare_followers_6m(self, obj):
         return ToggleProperty.objects.filter(
@@ -474,6 +550,7 @@ class ImageIndex(CelerySearchIndex, Indexable):
 
     is_iotd = BooleanField()
     is_top_pick = BooleanField()
+    is_top_pick_nomination = BooleanField()
 
     license = IntegerField(model_attr='license')
 
@@ -514,7 +591,7 @@ class ImageIndex(CelerySearchIndex, Indexable):
 
     def prepare_imaging_telescopes(self, obj):
         # Logging here just because it's the first "prepare" function.
-        log.debug("Indexing image %s: %d" % (obj.__class__.__name__, obj.pk))
+        log.debug("Indexing %s: %s" % (obj.__class__.__name__, obj.get_id()))
 
         return ["%s, %s" % (x.get("make"), x.get("name")) for x in obj.imaging_telescopes.all().values('make', 'name')]
 
@@ -591,6 +668,9 @@ class ImageIndex(CelerySearchIndex, Indexable):
 
     def prepare_is_top_pick(self, obj):
         return obj.iotdvote_set.count() > 0 and not hasattr(obj, 'iotd')
+
+    def prepare_is_top_pick_nomination(self, obj):
+        return obj.iotdsubmission_set.count() > 0 and obj.iotdvote_set.count() == 0
 
     def prepare_objects_in_field(self, obj):
         return obj.solution.objects_in_field if obj.solution else None
