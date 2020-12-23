@@ -65,16 +65,14 @@ describe("Forums", () => {
             .should("contain.value", "[quote=\"astrobin_dev\"]This is a reply.[/quote]");
     });
 
-    it("can-like", () => { 
+    it("should like", () => {
         cy.login({
             next: "/forum/c/astrobin/announcements/test-topic",
             username: "astrobin_dev2",
             password: "astrobin_dev2"
         });
 
-        cy.get(".property-like button").click();
-        cy.get(".property-like button")
-            .should("contain", "Unlike");
-        // cy.logout();
+        cy.get(".property-like button").first().click();
+        cy.get(".property-like button").first().should("contain", "Unlike");
     });
 });
