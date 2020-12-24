@@ -72,7 +72,17 @@ describe("Forums", () => {
             password: "astrobin_dev2"
         });
 
-        cy.get(".property-like button").first().click();
-        cy.get(".property-like button").first().should("contain", "Unlike");
+        let btn = cy.get(".post-related").first().find("button");
+
+        btn.contains("Like").click();
+        btn.contains("Unlike").should("be.visible");
     });
+
+    it("should unlike", () => {
+        let btn = cy.get(".post-related").first().find("button");
+
+        btn.contains("Unlike").click();
+        btn.contains("Like").should("be.visible");
+    });
+
 });
